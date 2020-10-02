@@ -333,7 +333,7 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
     // List all partitions in parallel and collect the files in them
     final String dbasePath = datasetBasePath;
     final SerializableConfiguration serializedConf = new SerializableConfiguration(hadoopConf);
-    int parallelism =  Math.min(partitions.size(), 100) + 1; // +1 to ensure non zero
+    int parallelism =  Math.min(partitions.size(), jsc.defaultParallelism()) + 1; // +1 to prevent 0 parallelism
     JavaPairRDD<String, FileStatus[]> partitionFileListRDD = jsc.parallelize(partitions, parallelism)
         .mapToPair(partition -> {
           FileSystem fsys = FSUtils.getFs(dbasePath, serializedConf.get());
@@ -518,7 +518,11 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
    */
   void update(HoodieCommitMetadata commitMetadata, String instantTime) {
     List<HoodieRecord> records = new LinkedList<>();
-    commitMetadata.getPartitionToWriteStats().forEach((partition, writeStats) -> {
+    List<String> allPartitions = new LinkedList<>();
+    commitMetadata.getPartitionToWriteStats().forEach((partitionStatName, writeStats) -> {
+      final String partition = partitionStatName.equals("") ? NON_PARTITIONED_NAME : partitionStatName;
+      allPartitions.add(partition);
+
       Map<String, Long> newFiles = new HashMap<>(writeStats.size());
       writeStats.forEach(hoodieWriteStat -> {
         String pathWithPartition = hoodieWriteStat.getPath();
@@ -526,25 +530,26 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
           // Empty partition
           return;
         }
-        String filename = pathWithPartition.substring(partition.length() + 1);
+
+        int offset = partition.equals(NON_PARTITIONED_NAME) ? 0 : partition.length() + 1;
+        String filename = pathWithPartition.substring(offset);
         ValidationUtils.checkState(!newFiles.containsKey(filename), "Duplicate files in HoodieCommitMetadata");
         newFiles.put(filename, hoodieWriteStat.getTotalWriteBytes());
       });
 
       // New files added to a partition
-      HoodieRecord record = HoodieMetadataPayload.createPartitionFilesRecord(partition, Option.of(newFiles),
-          Option.empty());
+      HoodieRecord record = HoodieMetadataPayload.createPartitionFilesRecord(
+          partition, Option.of(newFiles), Option.empty());
       records.add(record);
     });
 
     // New partitions created
-    HoodieRecord record = HoodieMetadataPayload.createPartitionListRecord(
-        new ArrayList<String>(commitMetadata.getPartitionToWriteStats().keySet()));
+    HoodieRecord record = HoodieMetadataPayload.createPartitionListRecord(new ArrayList<String>(allPartitions));
     records.add(record);
 
     LOG.info("Updating at " + instantTime + " from Commit/" + commitMetadata.getOperationType()
         + ". #partitions_updated=" + records.size());
-    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime, true);
+    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime);
   }
 
   /**
@@ -578,7 +583,7 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
 
     LOG.info("Updating at " + instantTime + " from CleanerPlan. #partitions_updated=" + records.size()
         + ", #files_deleted=" + fileDeleteCount[0]);
-    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime, true);
+    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime);
   }
 
   /**
@@ -603,7 +608,7 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
 
     LOG.info("Updating at " + instantTime + " from Clean. #partitions_updated=" + records.size()
         + ", #files_deleted=" + fileDeleteCount[0]);
-    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime, true);
+    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime);
   }
 
   /**
@@ -737,7 +742,7 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
 
     LOG.info("Updating at " + instantTime + " from " + operation + ". #partitions_updated=" + records.size()
         + ", #files_deleted=" + fileChangeCount[0] + ", #files_appended=" + fileChangeCount[1]);
-    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime, true);
+    commit(prepRecords(records, METADATA_PARTITION_NAME), instantTime);
   }
 
   /**
@@ -745,9 +750,8 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
    *
    * @param recordRDD The records to commit
    * @param instantTime The timestamp of instant to create
-   * @param performUpdate If True, records are upserted. If False, records are inserted
    */
-  private synchronized void commit(JavaRDD<HoodieRecord> recordRDD, String instantTime, boolean performUpdate) {
+  private synchronized void commit(JavaRDD<HoodieRecord> recordRDD, String instantTime) {
     ValidationUtils.checkState(!readOnly, "Metadata table cannot be committed in readonly mode");
     //ValidationUtils.checkArgument(!recordRDD.isEmpty());
 
@@ -760,12 +764,7 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
 
     try (HoodieWriteClient writeClient = new HoodieWriteClient(jsc, config, true)) {
       writeClient.startCommitWithTime(instantTime);
-      List<WriteStatus> statuses;
-      if (performUpdate) {
-        statuses = writeClient.upsertPreppedRecords(recordRDD, instantTime).collect();
-      } else {
-        statuses = writeClient.insertPreppedRecords(recordRDD, instantTime).collect();
-      }
+      List<WriteStatus> statuses = writeClient.upsertPreppedRecords(recordRDD, instantTime).collect();
       statuses.forEach(writeStatus -> {
         if (writeStatus.hasErrors()) {
           throw new HoodieMetadataException("Failed to commit metadata table records at instant " + instantTime);
@@ -810,14 +809,14 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
           .collect(Collectors.toList());
       if (logFiles.isEmpty()) {
         // No base and log files. All are new inserts
-        return jsc.parallelize(records);
+        return jsc.parallelize(records, 1);
       }
 
       fileId = logFiles.get(0).getFileId();
       instantTime = logFiles.get(0).getBaseCommitTime();
     }
 
-    return jsc.parallelize(records).map(r -> r.setCurrentLocation(new HoodieRecordLocation(instantTime, fileId)));
+    return jsc.parallelize(records, 1).map(r -> r.setCurrentLocation(new HoodieRecordLocation(instantTime, fileId)));
   }
 
   /**
@@ -835,6 +834,11 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
       }
 
       partitions = hoodieRecord.get().getData().getFilenames();
+      // Partition-less tables have a single empty partition
+      if (partitions.contains(NON_PARTITIONED_NAME)) {
+        partitions.remove(NON_PARTITIONED_NAME);
+        partitions.add("");
+      }
     }
 
     ++numLookupsAllPartitions;
@@ -882,6 +886,9 @@ public class HoodieMetadataImpl extends HoodieMetadataCommon {
     final Timer.Context context = this.metrics.getMetadataCtx(LOOKUP_FILES_STR);
 
     String partitionName = FSUtils.getRelativePartitionPath(new Path(datasetBasePath), partitionPath);
+    if (partitionName.equals("")) {
+      partitionName = NON_PARTITIONED_NAME;
+    }
 
     Option<HoodieRecord<HoodieMetadataPayload>> hoodieRecord = getMergedRecordByKey(partitionName);
     FileStatus[] statuses = {};
