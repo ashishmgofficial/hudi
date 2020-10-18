@@ -25,6 +25,8 @@ import org.apache.hudi.exception.HoodieIOException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.avro.Schema;
+import org.apache.log4j.LogManager;
+import org.apache.log4j.Logger;
 import org.apache.spark.api.java.JavaSparkContext;
 
 import java.io.IOException;
@@ -37,6 +39,8 @@ import java.util.Collections;
  * https://github.com/confluentinc/schema-registry
  */
 public class SchemaRegistryProvider extends SchemaProvider {
+
+  protected static final Logger LOG = LogManager.getLogger(SchemaRegistryProvider.class);
 
   /**
    * Configs supported.
